@@ -5,6 +5,93 @@ use crate::{
 use ark_ff_macros::unroll_for_loops;
 use ark_std::marker::PhantomData;
 
+/// Montgomery CIOS multiplication in 32-bit digits (wasm patch).
+///
+/// wasm32 has a native 32x32->64 multiply (`i64.mul`) but must emulate the
+/// 64x64->128 products of the 64-bit-limb CIOS, so the same no-carry CIOS
+/// runs faster on half-width digits there. The [u64; N] representation is
+/// unchanged: digits are split/joined at the boundaries of this routine.
+/// Requires `CAN_USE_NO_CARRY_MUL_OPT` (the caller dispatches only inside
+/// that branch). Compiled on every target so native differential tests can
+/// compare it against the 64-bit path; only wasm32 dispatches to it.
+#[doc(hidden)]
+#[unroll_for_loops(24)]
+pub fn mul_assign_u32_digits<T: MontConfig<N>, const N: usize>(
+    a: &mut Fp<MontBackend<T, N>, N>,
+    b: &Fp<MontBackend<T, N>, N>,
+) {
+    debug_assert!(T::CAN_USE_NO_CARRY_MUL_OPT);
+    debug_assert!(2 * N <= 24);
+    let inv32 = T::INV as u32;
+    let mut a32 = [0u32; 24];
+    let mut b32 = [0u32; 24];
+    let mut p32 = [0u32; 24];
+    for i in 0..N {
+        a32[2 * i] = (a.0).0[i] as u32;
+        a32[2 * i + 1] = ((a.0).0[i] >> 32) as u32;
+        b32[2 * i] = (b.0).0[i] as u32;
+        b32[2 * i + 1] = ((b.0).0[i] >> 32) as u32;
+        p32[2 * i] = T::MODULUS.0[i] as u32;
+        p32[2 * i + 1] = (T::MODULUS.0[i] >> 32) as u32;
+    }
+    // The 64-bit no-carry CIOS above, digit width halved: every product
+    // fits a u64 natively, and both carry chains stay in u64. The digit
+    // count is passed as a literal-boundable closure so the loops fully
+    // unroll for the N = 4 (pasta) case — `unroll_for_loops` cannot unroll
+    // `2 * N` expression bounds.
+    let mut t = [0u32; 24];
+    macro_rules! cios_rounds {
+        ($digits:literal) => {
+            for i in 0..$digits {
+                let bi = b32[i] as u64;
+                let r0 = t[0] as u64 + a32[0] as u64 * bi;
+                let mut carry1 = r0 >> 32;
+                let m = (r0 as u32).wrapping_mul(inv32) as u64;
+                // Low 32 bits of r0 + m*p[0] vanish by construction of m.
+                let mut carry2 = ((r0 as u32 as u64) + m * p32[0] as u64) >> 32;
+                for j in 1..$digits {
+                    let v1 = t[j] as u64 + a32[j] as u64 * bi + carry1;
+                    carry1 = v1 >> 32;
+                    let v2 = (v1 as u32 as u64) + m * p32[j] as u64 + carry2;
+                    carry2 = v2 >> 32;
+                    t[j - 1] = v2 as u32;
+                }
+                // No-carry optimization: the top digit absorbs both carries
+                // (the 64-bit condition CAN_USE_NO_CARRY_MUL_OPT tests the
+                // same top bit, so the guarantee holds at half width).
+                debug_assert!(carry1 + carry2 <= u32::MAX as u64);
+                t[$digits - 1] = (carry1 + carry2) as u32;
+            }
+        };
+    }
+    match N {
+        4 => cios_rounds!(8),
+        6 => cios_rounds!(12),
+        _ => {
+            for i in 0..(2 * N) {
+                let bi = b32[i] as u64;
+                let r0 = t[0] as u64 + a32[0] as u64 * bi;
+                let mut carry1 = r0 >> 32;
+                let m = (r0 as u32).wrapping_mul(inv32) as u64;
+                let mut carry2 = ((r0 as u32 as u64) + m * p32[0] as u64) >> 32;
+                for j in 1..(2 * N) {
+                    let v1 = t[j] as u64 + a32[j] as u64 * bi + carry1;
+                    carry1 = v1 >> 32;
+                    let v2 = (v1 as u32 as u64) + m * p32[j] as u64 + carry2;
+                    carry2 = v2 >> 32;
+                    t[j - 1] = v2 as u32;
+                }
+                debug_assert!(carry1 + carry2 <= u32::MAX as u64);
+                t[2 * N - 1] = (carry1 + carry2) as u32;
+            }
+        }
+    }
+    for i in 0..N {
+        (a.0).0[i] = t[2 * i] as u64 | ((t[2 * i + 1] as u64) << 32);
+    }
+    a.subtract_modulus();
+}
+
 /// A trait that specifies the constants and arithmetic procedures
 /// for Montgomery arithmetic over the prime field defined by `MODULUS`.
 ///
@@ -210,6 +297,11 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
                     6 => { ark_ff_asm::x86_64_asm_mul!(6, (a.0).0, (b.0).0); },
                     _ => unsafe { ark_std::hint::unreachable_unchecked() },
                 };
+            } else if cfg!(target_arch = "wasm32") && 2 * N <= 24 {
+                // wasm: 32-bit-digit CIOS (native 32x32->64 multiply);
+                // includes the final conditional subtraction.
+                mul_assign_u32_digits::<Self, N>(a, b);
+                return;
             } else {
                 let mut r = [0u64; N];
 
@@ -252,6 +344,13 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
             // We default to multiplying with `a` using the `Mul` impl
             // for the N == 1 case
             *a *= *a;
+            return;
+        }
+        // wasm: route squaring through the 32-bit-digit CIOS too — the
+        // generic squaring below is built on emulated 64x64->128 products.
+        if cfg!(target_arch = "wasm32") && Self::CAN_USE_NO_CARRY_MUL_OPT && 2 * N <= 24 {
+            let b = *a;
+            mul_assign_u32_digits::<Self, N>(a, &b);
             return;
         }
         #[cfg(all(
@@ -863,6 +962,50 @@ mod test {
     use ark_std::{str::FromStr, vec::*};
     use ark_test_curves::secp256k1::Fr;
     use num_bigint::{BigInt, BigUint, Sign};
+
+    /// The wasm 32-bit-digit CIOS agrees with the 64-bit no-carry CIOS.
+    /// The test field is bls12-381's Fr (255-bit modulus, spare top bit, so
+    /// the no-carry optimization applies); GENERATOR/TWO_ADIC constants are
+    /// placeholders — multiplication only uses MODULUS-derived constants.
+    /// The routine is compiled on every target precisely so this
+    /// differential test runs on native.
+    #[test]
+    fn test_wasm_mul_assign_u32_digits_matches_64bit() {
+        use crate::{AdditiveGroup, BigInt, Field, Fp, MontBackend};
+
+        struct NoCarry255;
+        impl super::MontConfig<4> for NoCarry255 {
+            const MODULUS: BigInt<4> = BigInt::new([
+                0xFFFFFFFF00000001,
+                0x53BDA402FFFE5BFE,
+                0x3339D80809A1D805,
+                0x73EDA753299D7D48,
+            ]);
+            const GENERATOR: Fp<MontBackend<Self, 4>, 4> =
+                Fp::new_unchecked(BigInt::new([7, 0, 0, 0]));
+            const TWO_ADIC_ROOT_OF_UNITY: Fp<MontBackend<Self, 4>, 4> =
+                Fp::new_unchecked(BigInt::new([0, 0, 0, 0]));
+        }
+        type F = Fp<MontBackend<NoCarry255, 4>, 4>;
+        assert!(<NoCarry255 as super::MontConfig<4>>::CAN_USE_NO_CARRY_MUL_OPT);
+
+        let minus_one = -F::ONE;
+        let mut values = ark_std::vec![F::ZERO, F::ONE, minus_one];
+        let mut x = F::from(3u64);
+        for _ in 0..32 {
+            x.square_in_place();
+            values.push(x);
+            values.push(x + minus_one);
+        }
+        for &a in &values {
+            for &b in &values {
+                let expected = a * b;
+                let mut got = a;
+                super::mul_assign_u32_digits::<NoCarry255, 4>(&mut got, &b);
+                assert_eq!(got, expected);
+            }
+        }
+    }
 
     #[test]
     fn test_mont_macro_correctness() {
