@@ -37,6 +37,9 @@ pub mod wasm_stats {
     use core::sync::atomic::AtomicU64;
     pub static MSM_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static MSM_POINTS: AtomicU64 = AtomicU64::new(0);
+    /// Calls/points at or above the batched-affine dispatch threshold.
+    pub static MSM_CALLS_BIG: AtomicU64 = AtomicU64::new(0);
+    pub static MSM_POINTS_BIG: AtomicU64 = AtomicU64::new(0);
 }
 
 #[inline]
@@ -46,6 +49,10 @@ pub(crate) fn record_msm(_n: usize) {
         use core::sync::atomic::Ordering::Relaxed;
         wasm_stats::MSM_CALLS.fetch_add(1, Relaxed);
         wasm_stats::MSM_POINTS.fetch_add(_n as u64, Relaxed);
+        if _n >= batch_affine::WASM_BATCH_AFFINE_MIN {
+            wasm_stats::MSM_CALLS_BIG.fetch_add(1, Relaxed);
+            wasm_stats::MSM_POINTS_BIG.fetch_add(_n as u64, Relaxed);
+        }
     }
 }
 
