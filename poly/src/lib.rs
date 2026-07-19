@@ -8,7 +8,9 @@
     rust_2018_idioms,
     rust_2021_compatibility
 )]
-#![forbid(unsafe_code)]
+// deny, not forbid: domain::radix2::lazy uses two runtime-validated memory
+// reinterpretations (see its module docs) under a local allow.
+#![deny(unsafe_code)]
 #![allow(
     clippy::many_single_char_names,
     clippy::suspicious_op_assign_impl,
