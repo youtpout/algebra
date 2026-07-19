@@ -13,6 +13,8 @@ mod fft;
 mod lazy;
 
 pub use lazy::set_wasm_lazy_fft;
+#[cfg(target_arch = "wasm32")]
+pub use lazy::wasm_stats;
 
 /// Factor that determines if a the degree aware FFT should be called.
 const DEGREE_AWARE_FFT_THRESHOLD_FACTOR: usize = 1 << 2;

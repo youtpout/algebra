@@ -27,6 +27,26 @@ type DefaultHasher = ahash::AHasher;
 )))]
 type DefaultHasher = fnv::FnvHasher;
 
+/// wasm32 kernel census: MSM call/point counters read by measurement
+/// harnesses (kimchi-wasm bench bindings). Shared wasm memory makes the
+/// atomics visible across the rayon workers.
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_stats {
+    use core::sync::atomic::AtomicU64;
+    pub static MSM_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static MSM_POINTS: AtomicU64 = AtomicU64::new(0);
+}
+
+#[inline]
+fn record_msm(_n: usize) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        wasm_stats::MSM_CALLS.fetch_add(1, Relaxed);
+        wasm_stats::MSM_POINTS.fetch_add(_n as u64, Relaxed);
+    }
+}
+
 pub trait VariableBaseMSM: ScalarMul {
     /// Computes an inner product between the [`PrimeField`] elements in `scalars`
     /// and the corresponding group elements in `bases`.
@@ -60,6 +80,7 @@ pub trait VariableBaseMSM: ScalarMul {
         bases: &[Self::MulBase],
         bigints: &[<Self::ScalarField as PrimeField>::BigInt],
     ) -> Self {
+        record_msm(bases.len().min(bigints.len()));
         if Self::NEGATION_IS_CHEAP {
             msm_bigint_wnaf(bases, bigints)
         } else {

@@ -254,6 +254,7 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
     }
 
     pub(super) fn io_helper<T: DomainCoeff<F>>(&self, xi: &mut [T], root: F) {
+        super::lazy::record_fft(xi.len());
         // wasm32: butterflies in the lazy-carry 29-bit domain when the
         // field qualifies (identical output layout — see radix2::lazy).
         #[cfg(target_arch = "wasm32")]
@@ -310,6 +311,7 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
     }
 
     pub(super) fn oi_helper<T: DomainCoeff<F>>(&self, xi: &mut [T], root: F, start_gap: usize) {
+        super::lazy::record_fft(xi.len());
         // wasm32: butterflies in the lazy-carry 29-bit domain when the
         // field qualifies (identical output layout — see radix2::lazy).
         #[cfg(target_arch = "wasm32")]

@@ -47,6 +47,28 @@ fn unpack(v: &L) -> W {
     core::array::from_fn(|i| v[i] as u64)
 }
 
+/// wasm32 kernel census: FFT call/size counters read by measurement
+/// harnesses. `FFT_WORK` accumulates n*log2(n) (butterfly count x2).
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_stats {
+    use core::sync::atomic::AtomicU64;
+    pub static FFT_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static FFT_ELEMS: AtomicU64 = AtomicU64::new(0);
+    pub static FFT_WORK: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Records one io/oi helper invocation (any code path).
+#[inline]
+pub(crate) fn record_fft(_n: usize) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        wasm_stats::FFT_CALLS.fetch_add(1, Relaxed);
+        wasm_stats::FFT_ELEMS.fetch_add(_n as u64, Relaxed);
+        wasm_stats::FFT_WORK.fetch_add((_n as u64) * (_n.max(2).ilog2() as u64), Relaxed);
+    }
+}
+
 /// Below this size the setup (constant derivation + conversions) is not
 /// worth amortizing over the stages.
 pub(crate) const MIN_LAZY_FFT_SIZE: usize = 128;
