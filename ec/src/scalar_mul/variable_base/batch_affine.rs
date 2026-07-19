@@ -73,9 +73,23 @@ pub fn msm_bigint_batch_affine<P: SWCurveConfig>(
         .flat_map(|s| super::make_digits(s, c, num_bits))
         .collect::<Vec<_>>();
 
-    let window_sums: Vec<_> = cfg_into_iter!(0..digits_count)
-        .map(|w| window_sum::<P>(bases, &scalar_digits, digits_count, w, c))
+    // Per-thread scratch reused across windows: at small sizes the
+    // per-window allocations (bucket tables + sorted copy) under the
+    // single-threaded wasm allocator lock dominate the arithmetic.
+    #[cfg(feature = "parallel")]
+    let window_sums: Vec<_> = (0..digits_count)
+        .into_par_iter()
+        .map_init(Scratch::<P>::default, |sc, w| {
+            window_sum::<P>(sc, bases, &scalar_digits, digits_count, w, c)
+        })
         .collect();
+    #[cfg(not(feature = "parallel"))]
+    let window_sums: Vec<_> = {
+        let mut sc = Scratch::<P>::default();
+        (0..digits_count)
+            .map(|w| window_sum::<P>(&mut sc, bases, &scalar_digits, digits_count, w, c))
+            .collect::<Vec<_>>()
+    };
 
     let lowest = *window_sums.first().unwrap();
     lowest
@@ -91,10 +105,36 @@ pub fn msm_bigint_batch_affine<P: SWCurveConfig>(
             })
 }
 
+/// Reusable per-thread buffers (see the map_init above).
+struct Scratch<P: SWCurveConfig> {
+    lens: Vec<u32>,
+    starts: Vec<u32>,
+    fill: Vec<u32>,
+    pts: Vec<Affine<P>>,
+    kinds: Vec<Kind>,
+    dens: Vec<P::BaseField>,
+    active: Vec<u32>,
+}
+
+impl<P: SWCurveConfig> Default for Scratch<P> {
+    fn default() -> Self {
+        Scratch {
+            lens: Vec::new(),
+            starts: Vec::new(),
+            fill: Vec::new(),
+            pts: Vec::new(),
+            kinds: Vec::new(),
+            dens: Vec::new(),
+            active: Vec::new(),
+        }
+    }
+}
+
 /// One window: counting-sort the (sign-applied) points by bucket, reduce
 /// each bucket with level-batched affine additions, then the usual
 /// running-sum bucket reduction.
 fn window_sum<P: SWCurveConfig>(
+    sc: &mut Scratch<P>,
     bases: &[Affine<P>],
     scalar_digits: &[i64],
     stride: usize,
@@ -105,21 +145,33 @@ fn window_sum<P: SWCurveConfig>(
     // not recentered and can reach 2^c - 1 in absolute value.
     let n_buckets = 1usize << c;
 
-    let mut lens = vec![0u32; n_buckets];
+    let Scratch {
+        lens,
+        starts,
+        fill,
+        pts,
+        kinds,
+        dens,
+        active,
+    } = sc;
+    lens.clear();
+    lens.resize(n_buckets, 0);
     for (j, base) in bases.iter().enumerate() {
         let d = scalar_digits[j * stride + w];
         if d != 0 && !base.is_zero() {
             lens[(d.unsigned_abs() - 1) as usize] += 1;
         }
     }
-    let mut starts = vec![0u32; n_buckets];
+    starts.clear();
     let mut acc = 0u32;
     for b in 0..n_buckets {
-        starts[b] = acc;
+        starts.push(acc);
         acc += lens[b];
     }
-    let mut fill = starts.clone();
-    let mut pts: Vec<Affine<P>> = vec![Affine::zero(); acc as usize];
+    fill.clear();
+    fill.extend_from_slice(starts);
+    pts.clear();
+    pts.resize(acc as usize, Affine::zero());
     for (j, base) in bases.iter().enumerate() {
         let d = scalar_digits[j * stride + w];
         if d == 0 || base.is_zero() {
@@ -136,13 +188,12 @@ fn window_sum<P: SWCurveConfig>(
     // every write strictly below all remaining reads. Pass 1 classifies
     // each pair (one byte) and collects the denominators; pass 2 re-reads
     // the untouched operands and writes the results.
-    let mut kinds: Vec<Kind> = Vec::new();
-    let mut dens: Vec<P::BaseField> = Vec::new();
-    let mut active: Vec<u32> = (0..n_buckets as u32).filter(|&b| lens[b as usize] > 1).collect();
+    active.clear();
+    active.extend((0..n_buckets as u32).filter(|&b| lens[b as usize] > 1));
     while !active.is_empty() {
         kinds.clear();
         dens.clear();
-        for &b in &active {
+        for &b in active.iter() {
             let s = starts[b as usize] as usize;
             let l = lens[b as usize] as usize;
             for k in 0..l / 2 {
@@ -156,9 +207,9 @@ fn window_sum<P: SWCurveConfig>(
                 kinds.push(kind);
             }
         }
-        batch_inversion(&mut dens);
+        batch_inversion(dens);
         let mut i = 0usize;
-        for &b in &active {
+        for &b in active.iter() {
             let s = starts[b as usize] as usize;
             let l = lens[b as usize] as usize;
             let pairs = l / 2;
