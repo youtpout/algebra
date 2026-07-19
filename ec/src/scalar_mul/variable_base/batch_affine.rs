@@ -24,9 +24,30 @@
 use crate::short_weierstrass::{Affine, Projective, SWCurveConfig};
 use crate::AffineRepr;
 use ark_ff::{batch_inversion, AdditiveGroup, Field, PrimeField, Zero};
-use ark_std::{cfg_into_iter, vec, vec::Vec};
+use ark_std::{vec, vec::Vec};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+/// Below this size the default mixed-addition path wins: measured on
+/// V8/x64 (31-thread pool, Vesta): 2^12 +28%, 2^13 +6%, 2^14 -13%,
+/// 2^15 -17%, 2^16 -17.5% vs the default MSM.
+pub const WASM_BATCH_AFFINE_MIN: usize = 1 << 14;
+
+/// Runtime switch for the wasm32 batched-affine MSM dispatch (default
+/// on). Kept for one-build A/B measurement and as a production
+/// kill-switch, like the lazy-FFT one.
+static BATCH_AFFINE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Enables or disables the wasm32 batched-affine MSM dispatch.
+pub fn set_wasm_batch_affine_msm(enabled: bool) {
+    BATCH_AFFINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn batch_affine_enabled() -> bool {
+    BATCH_AFFINE_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -40,13 +61,6 @@ enum Kind {
     TakeB,
     /// `a = -b` or a doubling with y = 0: result identity.
     Identity,
-}
-
-struct Pending<P: SWCurveConfig> {
-    a: Affine<P>,
-    b: Affine<P>,
-    out: usize,
-    kind: Kind,
 }
 
 /// MSM over signed windowed digits with batched-affine bucket trees.
@@ -80,9 +94,23 @@ pub fn msm_bigint_batch_affine<P: SWCurveConfig>(
         .flat_map(|s| super::make_digits(s, c, num_bits))
         .collect::<Vec<_>>();
 
-    let window_sums: Vec<_> = cfg_into_iter!(0..digits_count)
-        .map(|w| window_sum::<P>(bases, &scalar_digits, digits_count, w, c))
+    // Per-thread scratch reused across windows: at small sizes the
+    // per-window allocations (bucket tables + sorted copy) under the
+    // single-threaded wasm allocator lock dominate the arithmetic.
+    #[cfg(feature = "parallel")]
+    let window_sums: Vec<_> = (0..digits_count)
+        .into_par_iter()
+        .map_init(Scratch::<P>::default, |sc, w| {
+            window_sum::<P>(sc, bases, &scalar_digits, digits_count, w, c)
+        })
         .collect();
+    #[cfg(not(feature = "parallel"))]
+    let window_sums: Vec<_> = {
+        let mut sc = Scratch::<P>::default();
+        (0..digits_count)
+            .map(|w| window_sum::<P>(&mut sc, bases, &scalar_digits, digits_count, w, c))
+            .collect::<Vec<_>>()
+    };
 
     let lowest = *window_sums.first().unwrap();
     lowest
@@ -98,10 +126,36 @@ pub fn msm_bigint_batch_affine<P: SWCurveConfig>(
             })
 }
 
+/// Reusable per-thread buffers (see the map_init above).
+struct Scratch<P: SWCurveConfig> {
+    lens: Vec<u32>,
+    starts: Vec<u32>,
+    fill: Vec<u32>,
+    pts: Vec<Affine<P>>,
+    kinds: Vec<Kind>,
+    dens: Vec<P::BaseField>,
+    active: Vec<u32>,
+}
+
+impl<P: SWCurveConfig> Default for Scratch<P> {
+    fn default() -> Self {
+        Scratch {
+            lens: Vec::new(),
+            starts: Vec::new(),
+            fill: Vec::new(),
+            pts: Vec::new(),
+            kinds: Vec::new(),
+            dens: Vec::new(),
+            active: Vec::new(),
+        }
+    }
+}
+
 /// One window: counting-sort the (sign-applied) points by bucket, reduce
 /// each bucket with level-batched affine additions, then the usual
 /// running-sum bucket reduction.
 fn window_sum<P: SWCurveConfig>(
+    sc: &mut Scratch<P>,
     bases: &[Affine<P>],
     scalar_digits: &[i64],
     stride: usize,
@@ -112,21 +166,33 @@ fn window_sum<P: SWCurveConfig>(
     // not recentered and can reach 2^c - 1 in absolute value.
     let n_buckets = 1usize << c;
 
-    let mut lens = vec![0u32; n_buckets];
+    let Scratch {
+        lens,
+        starts,
+        fill,
+        pts,
+        kinds,
+        dens,
+        active,
+    } = sc;
+    lens.clear();
+    lens.resize(n_buckets, 0);
     for (j, base) in bases.iter().enumerate() {
         let d = scalar_digits[j * stride + w];
         if d != 0 && !base.is_zero() {
             lens[(d.unsigned_abs() - 1) as usize] += 1;
         }
     }
-    let mut starts = vec![0u32; n_buckets];
+    starts.clear();
     let mut acc = 0u32;
     for b in 0..n_buckets {
-        starts[b] = acc;
+        starts.push(acc);
         acc += lens[b];
     }
-    let mut fill = starts.clone();
-    let mut pts: Vec<Affine<P>> = vec![Affine::zero(); acc as usize];
+    fill.clear();
+    fill.extend_from_slice(starts);
+    pts.clear();
+    pts.resize(acc as usize, Affine::zero());
     for (j, base) in bases.iter().enumerate() {
         let d = scalar_digits[j * stride + w];
         if d == 0 || base.is_zero() {
@@ -137,44 +203,48 @@ fn window_sum<P: SWCurveConfig>(
         fill[idx] += 1;
     }
 
-    // Tree reduction. Reads all happen while collecting the level (operand
-    // values are copied into `pending`), writes all happen in the batch
-    // application — in-place layout per bucket, no compaction: results of
-    // a length-l bucket land at offsets 0..ceil(l/2) of the same bucket.
-    let mut pending: Vec<Pending<P>> = Vec::new();
-    let mut dens: Vec<P::BaseField> = Vec::new();
-    loop {
-        pending.clear();
-        for b in 0..n_buckets {
-            let s = starts[b] as usize;
-            let l = lens[b] as usize;
-            if l < 2 {
-                continue;
+    // Tree reduction, one batch inversion per level, in place and without
+    // materializing operands: within a bucket the pair k reads offsets
+    // 2k/2k+1 and writes offset k, so processing pairs in order keeps
+    // every write strictly below all remaining reads. Pass 1 classifies
+    // each pair (one byte) and collects the denominators; pass 2 re-reads
+    // the untouched operands and writes the results.
+    active.clear();
+    active.extend((0..n_buckets as u32).filter(|&b| lens[b as usize] > 1));
+    while !active.is_empty() {
+        kinds.clear();
+        dens.clear();
+        for &b in active.iter() {
+            let s = starts[b as usize] as usize;
+            let l = lens[b as usize] as usize;
+            for k in 0..l / 2 {
+                let (a, q) = (&pts[s + 2 * k], &pts[s + 2 * k + 1]);
+                let kind = classify::<P>(a, q);
+                dens.push(match kind {
+                    Kind::Add => q.x - a.x,
+                    Kind::Double => a.y.double(),
+                    _ => P::BaseField::ONE,
+                });
+                kinds.push(kind);
             }
+        }
+        batch_inversion(dens);
+        let mut i = 0usize;
+        for &b in active.iter() {
+            let s = starts[b as usize] as usize;
+            let l = lens[b as usize] as usize;
             let pairs = l / 2;
             for k in 0..pairs {
-                pending.push(Pending {
-                    a: pts[s + 2 * k],
-                    b: pts[s + 2 * k + 1],
-                    out: s + k,
-                    kind: Kind::Add,
-                });
+                let (a, q) = (pts[s + 2 * k], pts[s + 2 * k + 1]);
+                pts[s + k] = apply::<P>(&a, &q, kinds[i], &dens[i]);
+                i += 1;
             }
-            if l % 2 == 1 && l > 1 {
-                // Odd leftover moves down to close the level's layout.
-                pending.push(Pending {
-                    a: pts[s + l - 1],
-                    b: Affine::zero(),
-                    out: s + pairs,
-                    kind: Kind::TakeA,
-                });
+            if l % 2 == 1 {
+                pts[s + pairs] = pts[s + l - 1];
             }
-            lens[b] = (pairs + l % 2) as u32;
+            lens[b as usize] = (pairs + l % 2) as u32;
         }
-        if pending.is_empty() {
-            break;
-        }
-        batch_apply::<P>(&mut pts, &mut pending, &mut dens);
+        active.retain(|&b| lens[b as usize] > 1);
     }
 
     let mut running = Projective::<P>::zero();
@@ -188,53 +258,41 @@ fn window_sum<P: SWCurveConfig>(
     res
 }
 
-/// Classifies every pending addition, batch-inverts the denominators of
-/// the non-degenerate ones, then computes and writes all results.
-fn batch_apply<P: SWCurveConfig>(
-    pts: &mut [Affine<P>],
-    pending: &mut [Pending<P>],
-    dens: &mut Vec<P::BaseField>,
-) {
-    dens.clear();
-    for p in pending.iter_mut() {
-        p.kind = if p.a.is_zero() {
-            Kind::TakeB
-        } else if p.b.is_zero() {
-            Kind::TakeA
-        } else if p.a.x != p.b.x {
-            Kind::Add
-        } else if p.a.y == p.b.y && !p.a.y.is_zero() {
-            Kind::Double
-        } else {
-            Kind::Identity
-        };
-        dens.push(match p.kind {
-            Kind::Add => p.b.x - p.a.x,
-            Kind::Double => p.a.y.double(),
-            _ => P::BaseField::ONE,
-        });
+#[inline(always)]
+fn classify<P: SWCurveConfig>(a: &Affine<P>, b: &Affine<P>) -> Kind {
+    if a.is_zero() {
+        Kind::TakeB
+    } else if b.is_zero() {
+        Kind::TakeA
+    } else if a.x != b.x {
+        Kind::Add
+    } else if a.y == b.y && !a.y.is_zero() {
+        Kind::Double
+    } else {
+        Kind::Identity
     }
-    batch_inversion(dens);
-    for (p, inv) in pending.iter().zip(dens.iter()) {
-        let out = match p.kind {
-            Kind::TakeA => p.a,
-            Kind::TakeB => p.b,
-            Kind::Identity => Affine::zero(),
-            Kind::Add => {
-                let lambda = (p.b.y - p.a.y) * inv;
-                let x3 = lambda.square() - p.a.x - p.b.x;
-                let y3 = lambda * (p.a.x - x3) - p.a.y;
-                Affine::new_unchecked(x3, y3)
-            },
-            Kind::Double => {
-                let sq = p.a.x.square();
-                let lambda = (sq.double() + sq + P::COEFF_A) * inv;
-                let x3 = lambda.square() - p.a.x.double();
-                let y3 = lambda * (p.a.x - x3) - p.a.y;
-                Affine::new_unchecked(x3, y3)
-            },
-        };
-        pts[p.out] = out;
+}
+
+/// One affine addition with its batch-inverted denominator.
+#[inline(always)]
+fn apply<P: SWCurveConfig>(a: &Affine<P>, b: &Affine<P>, kind: Kind, inv: &P::BaseField) -> Affine<P> {
+    match kind {
+        Kind::TakeA => *a,
+        Kind::TakeB => *b,
+        Kind::Identity => Affine::zero(),
+        Kind::Add => {
+            let lambda = (b.y - a.y) * inv;
+            let x3 = lambda.square() - a.x - b.x;
+            let y3 = lambda * (a.x - x3) - a.y;
+            Affine::new_unchecked(x3, y3)
+        },
+        Kind::Double => {
+            let sq = a.x.square();
+            let lambda = (sq.double() + sq + P::COEFF_A) * inv;
+            let x3 = lambda.square() - a.x.double();
+            let y3 = lambda * (a.x - x3) - a.y;
+            Affine::new_unchecked(x3, y3)
+        },
     }
 }
 
