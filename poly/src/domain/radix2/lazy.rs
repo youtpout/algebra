@@ -51,6 +51,24 @@ fn unpack(v: &L) -> W {
 /// worth amortizing over the stages.
 pub(crate) const MIN_LAZY_FFT_SIZE: usize = 128;
 
+/// Runtime kill-switch for the wasm32 lazy FFT dispatch (default on).
+/// The boundary conversions (~2.5n multiplications) only pay for
+/// themselves where butterfly arithmetic dominates — hosts can turn the
+/// dispatch off (or measurement harnesses can compare both paths in one
+/// build).
+static LAZY_FFT_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Enables or disables the wasm32 lazy-carry FFT dispatch at runtime.
+pub fn set_wasm_lazy_fft(enabled: bool) {
+    LAZY_FFT_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn lazy_fft_enabled() -> bool {
+    LAZY_FFT_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // Same empirical thresholds as fft.rs (private to that module).
 const MIN_GAP_SIZE_FOR_PARALLELIZATION: usize = 1 << 10;
 const MIN_INPUT_SIZE_FOR_PARALLELIZATION: usize = 1 << 10;

@@ -257,7 +257,7 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
         // wasm32: butterflies in the lazy-carry 29-bit domain when the
         // field qualifies (identical output layout — see radix2::lazy).
         #[cfg(target_arch = "wasm32")]
-        if xi.len() >= super::lazy::MIN_LAZY_FFT_SIZE {
+        if xi.len() >= super::lazy::MIN_LAZY_FFT_SIZE && super::lazy::lazy_fft_enabled() {
             if let Some(xi) = super::lazy::as_field_mut::<F, T>(xi) {
                 if let Some(params) = super::lazy::detect::<F>() {
                     return self.io_helper_lazy(xi, root, &params);
@@ -313,7 +313,7 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
         // wasm32: butterflies in the lazy-carry 29-bit domain when the
         // field qualifies (identical output layout — see radix2::lazy).
         #[cfg(target_arch = "wasm32")]
-        if xi.len() >= super::lazy::MIN_LAZY_FFT_SIZE {
+        if xi.len() >= super::lazy::MIN_LAZY_FFT_SIZE && super::lazy::lazy_fft_enabled() {
             if let Some(xi) = super::lazy::as_field_mut::<F, T>(xi) {
                 if let Some(params) = super::lazy::detect::<F>() {
                     return self.oi_helper_lazy(xi, root, start_gap, &params);
