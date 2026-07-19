@@ -15,6 +15,7 @@ use ark_std::marker::PhantomData;
 /// that branch). Compiled on every target so native differential tests can
 /// compare it against the 64-bit path; only wasm32 dispatches to it.
 #[doc(hidden)]
+#[inline(always)]
 #[unroll_for_loops(24)]
 pub fn mul_assign_u32_digits<T: MontConfig<N>, const N: usize>(
     a: &mut Fp<MontBackend<T, N>, N>,
