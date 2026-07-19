@@ -27,7 +27,25 @@ use ark_std::{cfg_chunks_mut, cfg_into_iter, cfg_iter, cfg_iter_mut, vec, vec::*
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-type L = [u64; lz::LIMBS];
+/// In-memory element: 29-bit limbs packed in u32 (36 bytes, near parity
+/// with the 32-byte field element — the first u64-array cut of this module
+/// measured 2.25x the memory traffic and LOST to the generic parallel FFT
+/// on a wide pool despite cheaper butterflies). Limbs at rest are < 2^29,
+/// so u32 storage is lossless; butterflies unpack into u64 locals, which
+/// wasm loads/extends for free (i64.load32_u).
+type L = [u32; lz::LIMBS];
+/// Unpacked working element (the `ark_ff::lazy29` op type).
+type W = [u64; lz::LIMBS];
+
+#[inline(always)]
+fn pack(v: &W) -> L {
+    core::array::from_fn(|i| v[i] as u32)
+}
+
+#[inline(always)]
+fn unpack(v: &L) -> W {
+    core::array::from_fn(|i| v[i] as u64)
+}
 
 /// Below this size the setup (constant derivation + conversions) is not
 /// worth amortizing over the stages.
@@ -90,18 +108,19 @@ fn repr_mut<F>(x: &mut F) -> &mut [u64; 4] {
 /// `fft.rs::butterfly_fn_io`, element ops in the lazy domain.
 #[inline(always)]
 fn butterfly_io(pr: &lz::Params, lo: &mut L, hi: &mut L, root: &L) {
-    let neg = lz::sub_p(pr, lo, hi);
-    *lo = lz::add_p(pr, lo, hi);
-    *hi = lz::mont_mul_p(pr, &neg, root);
+    let (l, h, r) = (unpack(lo), unpack(hi), unpack(root));
+    let neg = lz::sub_p(pr, &l, &h);
+    *lo = pack(&lz::add_p(pr, &l, &h));
+    *hi = pack(&lz::mont_mul_p(pr, &neg, &r));
 }
 
 /// `fft.rs::butterfly_fn_oi`, element ops in the lazy domain.
 #[inline(always)]
 fn butterfly_oi(pr: &lz::Params, lo: &mut L, hi: &mut L, root: &L) {
-    let t = lz::mont_mul_p(pr, hi, root);
-    let neg = lz::sub_p(pr, lo, &t);
-    *lo = lz::add_p(pr, lo, &t);
-    *hi = neg;
+    let (l, h, r) = (unpack(lo), unpack(hi), unpack(root));
+    let t = lz::mont_mul_p(pr, &h, &r);
+    *hi = pack(&lz::sub_p(pr, &l, &t));
+    *lo = pack(&lz::add_p(pr, &l, &t));
 }
 
 /// `fft.rs::apply_butterfly` with lazy elements — identical chunking and
@@ -153,8 +172,8 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
     /// `pr`).
     pub(crate) fn io_helper_lazy(&self, xi: &mut [F], root: F, pr: &lz::Params) {
         let roots_f = self.roots_of_unity(root);
-        let mut roots: Vec<L> = cfg_iter!(roots_f).map(|r| lz::enter_p(pr, repr(r))).collect();
-        let mut d: Vec<L> = cfg_iter!(xi).map(|x| lz::enter_p(pr, repr(x))).collect();
+        let mut roots: Vec<L> = cfg_iter!(roots_f).map(|r| pack(&lz::enter_p(pr, repr(r)))).collect();
+        let mut d: Vec<L> = cfg_iter!(xi).map(|x| pack(&lz::enter_p(pr, repr(x)))).collect();
 
         let mut first = true;
 
@@ -196,20 +215,20 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
 
         cfg_iter_mut!(xi)
             .zip(d)
-            .for_each(|(x, v)| *repr_mut(x) = lz::exit_p(pr, &v));
+            .for_each(|(x, v)| *repr_mut(x) = lz::exit_p(pr, &unpack(&v)));
     }
 
     /// `fft.rs::oi_helper` with butterflies in the lazy domain (same output
     /// layout). `F` must have been accepted by [`detect`].
     pub(crate) fn oi_helper_lazy(&self, xi: &mut [F], root: F, start_gap: usize, pr: &lz::Params) {
         let roots_f = self.roots_of_unity(root);
-        let roots_cache: Vec<L> = cfg_iter!(roots_f).map(|r| lz::enter_p(pr, repr(r))).collect();
-        let mut d: Vec<L> = cfg_iter!(xi).map(|x| lz::enter_p(pr, repr(x))).collect();
+        let roots_cache: Vec<L> = cfg_iter!(roots_f).map(|r| pack(&lz::enter_p(pr, repr(r)))).collect();
+        let mut d: Vec<L> = cfg_iter!(xi).map(|x| pack(&lz::enter_p(pr, repr(x)))).collect();
 
         // Contiguous stage roots at every stage (see io_helper_lazy): the
         // largest compacted stage has gap = len/4 (num_chunks == 1 reads
         // the cache directly, stride 1).
-        let mut compacted_roots = vec![[0u64; lz::LIMBS]; roots_cache.len() / 2];
+        let mut compacted_roots = vec![[0u32; lz::LIMBS]; roots_cache.len() / 2];
 
         #[cfg(feature = "parallel")]
         let max_threads = rayon::current_num_threads();
@@ -250,7 +269,7 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
 
         cfg_iter_mut!(xi)
             .zip(d)
-            .for_each(|(x, v)| *repr_mut(x) = lz::exit_p(pr, &v));
+            .for_each(|(x, v)| *repr_mut(x) = lz::exit_p(pr, &unpack(&v)));
     }
 }
 
