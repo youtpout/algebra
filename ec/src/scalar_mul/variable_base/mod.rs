@@ -27,6 +27,8 @@ type DefaultHasher = ahash::AHasher;
 )))]
 type DefaultHasher = fnv::FnvHasher;
 
+pub mod batch_affine;
+
 /// wasm32 kernel census: MSM call/point counters read by measurement
 /// harnesses (kimchi-wasm bench bindings). Shared wasm memory makes the
 /// atomics visible across the rayon workers.
