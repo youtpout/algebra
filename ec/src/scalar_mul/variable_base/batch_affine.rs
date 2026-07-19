@@ -42,13 +42,6 @@ enum Kind {
     Identity,
 }
 
-struct Pending<P: SWCurveConfig> {
-    a: Affine<P>,
-    b: Affine<P>,
-    out: usize,
-    kind: Kind,
-}
-
 /// MSM over signed windowed digits with batched-affine bucket trees.
 pub fn msm_bigint_batch_affine<P: SWCurveConfig>(
     bases: &[Affine<P>],
@@ -137,44 +130,49 @@ fn window_sum<P: SWCurveConfig>(
         fill[idx] += 1;
     }
 
-    // Tree reduction. Reads all happen while collecting the level (operand
-    // values are copied into `pending`), writes all happen in the batch
-    // application — in-place layout per bucket, no compaction: results of
-    // a length-l bucket land at offsets 0..ceil(l/2) of the same bucket.
-    let mut pending: Vec<Pending<P>> = Vec::new();
+    // Tree reduction, one batch inversion per level, in place and without
+    // materializing operands: within a bucket the pair k reads offsets
+    // 2k/2k+1 and writes offset k, so processing pairs in order keeps
+    // every write strictly below all remaining reads. Pass 1 classifies
+    // each pair (one byte) and collects the denominators; pass 2 re-reads
+    // the untouched operands and writes the results.
+    let mut kinds: Vec<Kind> = Vec::new();
     let mut dens: Vec<P::BaseField> = Vec::new();
-    loop {
-        pending.clear();
-        for b in 0..n_buckets {
-            let s = starts[b] as usize;
-            let l = lens[b] as usize;
-            if l < 2 {
-                continue;
+    let mut active: Vec<u32> = (0..n_buckets as u32).filter(|&b| lens[b as usize] > 1).collect();
+    while !active.is_empty() {
+        kinds.clear();
+        dens.clear();
+        for &b in &active {
+            let s = starts[b as usize] as usize;
+            let l = lens[b as usize] as usize;
+            for k in 0..l / 2 {
+                let (a, q) = (&pts[s + 2 * k], &pts[s + 2 * k + 1]);
+                let kind = classify::<P>(a, q);
+                dens.push(match kind {
+                    Kind::Add => q.x - a.x,
+                    Kind::Double => a.y.double(),
+                    _ => P::BaseField::ONE,
+                });
+                kinds.push(kind);
             }
+        }
+        batch_inversion(&mut dens);
+        let mut i = 0usize;
+        for &b in &active {
+            let s = starts[b as usize] as usize;
+            let l = lens[b as usize] as usize;
             let pairs = l / 2;
             for k in 0..pairs {
-                pending.push(Pending {
-                    a: pts[s + 2 * k],
-                    b: pts[s + 2 * k + 1],
-                    out: s + k,
-                    kind: Kind::Add,
-                });
+                let (a, q) = (pts[s + 2 * k], pts[s + 2 * k + 1]);
+                pts[s + k] = apply::<P>(&a, &q, kinds[i], &dens[i]);
+                i += 1;
             }
-            if l % 2 == 1 && l > 1 {
-                // Odd leftover moves down to close the level's layout.
-                pending.push(Pending {
-                    a: pts[s + l - 1],
-                    b: Affine::zero(),
-                    out: s + pairs,
-                    kind: Kind::TakeA,
-                });
+            if l % 2 == 1 {
+                pts[s + pairs] = pts[s + l - 1];
             }
-            lens[b] = (pairs + l % 2) as u32;
+            lens[b as usize] = (pairs + l % 2) as u32;
         }
-        if pending.is_empty() {
-            break;
-        }
-        batch_apply::<P>(&mut pts, &mut pending, &mut dens);
+        active.retain(|&b| lens[b as usize] > 1);
     }
 
     let mut running = Projective::<P>::zero();
@@ -188,53 +186,41 @@ fn window_sum<P: SWCurveConfig>(
     res
 }
 
-/// Classifies every pending addition, batch-inverts the denominators of
-/// the non-degenerate ones, then computes and writes all results.
-fn batch_apply<P: SWCurveConfig>(
-    pts: &mut [Affine<P>],
-    pending: &mut [Pending<P>],
-    dens: &mut Vec<P::BaseField>,
-) {
-    dens.clear();
-    for p in pending.iter_mut() {
-        p.kind = if p.a.is_zero() {
-            Kind::TakeB
-        } else if p.b.is_zero() {
-            Kind::TakeA
-        } else if p.a.x != p.b.x {
-            Kind::Add
-        } else if p.a.y == p.b.y && !p.a.y.is_zero() {
-            Kind::Double
-        } else {
-            Kind::Identity
-        };
-        dens.push(match p.kind {
-            Kind::Add => p.b.x - p.a.x,
-            Kind::Double => p.a.y.double(),
-            _ => P::BaseField::ONE,
-        });
+#[inline(always)]
+fn classify<P: SWCurveConfig>(a: &Affine<P>, b: &Affine<P>) -> Kind {
+    if a.is_zero() {
+        Kind::TakeB
+    } else if b.is_zero() {
+        Kind::TakeA
+    } else if a.x != b.x {
+        Kind::Add
+    } else if a.y == b.y && !a.y.is_zero() {
+        Kind::Double
+    } else {
+        Kind::Identity
     }
-    batch_inversion(dens);
-    for (p, inv) in pending.iter().zip(dens.iter()) {
-        let out = match p.kind {
-            Kind::TakeA => p.a,
-            Kind::TakeB => p.b,
-            Kind::Identity => Affine::zero(),
-            Kind::Add => {
-                let lambda = (p.b.y - p.a.y) * inv;
-                let x3 = lambda.square() - p.a.x - p.b.x;
-                let y3 = lambda * (p.a.x - x3) - p.a.y;
-                Affine::new_unchecked(x3, y3)
-            },
-            Kind::Double => {
-                let sq = p.a.x.square();
-                let lambda = (sq.double() + sq + P::COEFF_A) * inv;
-                let x3 = lambda.square() - p.a.x.double();
-                let y3 = lambda * (p.a.x - x3) - p.a.y;
-                Affine::new_unchecked(x3, y3)
-            },
-        };
-        pts[p.out] = out;
+}
+
+/// One affine addition with its batch-inverted denominator.
+#[inline(always)]
+fn apply<P: SWCurveConfig>(a: &Affine<P>, b: &Affine<P>, kind: Kind, inv: &P::BaseField) -> Affine<P> {
+    match kind {
+        Kind::TakeA => *a,
+        Kind::TakeB => *b,
+        Kind::Identity => Affine::zero(),
+        Kind::Add => {
+            let lambda = (b.y - a.y) * inv;
+            let x3 = lambda.square() - a.x - b.x;
+            let y3 = lambda * (a.x - x3) - a.y;
+            Affine::new_unchecked(x3, y3)
+        },
+        Kind::Double => {
+            let sq = a.x.square();
+            let lambda = (sq.double() + sq + P::COEFF_A) * inv;
+            let x3 = lambda.square() - a.x.double();
+            let y3 = lambda * (a.x - x3) - a.y;
+            Affine::new_unchecked(x3, y3)
+        },
     }
 }
 
