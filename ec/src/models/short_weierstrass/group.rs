@@ -650,6 +650,27 @@ impl<P: SWCurveConfig> VariableBaseMSM for Projective<P> {
     fn msm(bases: &[Self::MulBase], bigints: &[Self::ScalarField]) -> Result<Self, usize> {
         P::msm(bases, bigints)
     }
+
+    /// wasm32: batched-affine bucket accumulation past the measured
+    /// crossover (see `scalar_mul::variable_base::batch_affine`); below
+    /// it, or when switched off, the default paths.
+    #[cfg(target_arch = "wasm32")]
+    fn msm_bigint(
+        bases: &[Self::MulBase],
+        bigints: &[<Self::ScalarField as PrimeField>::BigInt],
+    ) -> Self {
+        use crate::scalar_mul::variable_base as vb;
+        let n = bases.len().min(bigints.len());
+        vb::record_msm(n);
+        if n >= vb::batch_affine::WASM_BATCH_AFFINE_MIN && vb::batch_affine::batch_affine_enabled()
+        {
+            vb::batch_affine::msm_bigint_batch_affine::<P>(bases, bigints)
+        } else if Self::NEGATION_IS_CHEAP {
+            vb::msm_bigint_wnaf(bases, bigints)
+        } else {
+            vb::msm_bigint(bases, bigints)
+        }
+    }
 }
 
 impl<P: SWCurveConfig, T: Borrow<Affine<P>>> core::iter::Sum<T> for Projective<P> {

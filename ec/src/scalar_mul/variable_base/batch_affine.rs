@@ -24,9 +24,30 @@
 use crate::short_weierstrass::{Affine, Projective, SWCurveConfig};
 use crate::AffineRepr;
 use ark_ff::{batch_inversion, AdditiveGroup, Field, PrimeField, Zero};
-use ark_std::{cfg_into_iter, vec, vec::Vec};
+use ark_std::{vec, vec::Vec};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+/// Below this size the default mixed-addition path wins: measured on
+/// V8/x64 (31-thread pool, Vesta): 2^12 +28%, 2^13 +6%, 2^14 -13%,
+/// 2^15 -17%, 2^16 -17.5% vs the default MSM.
+pub const WASM_BATCH_AFFINE_MIN: usize = 1 << 14;
+
+/// Runtime switch for the wasm32 batched-affine MSM dispatch (default
+/// on). Kept for one-build A/B measurement and as a production
+/// kill-switch, like the lazy-FFT one.
+static BATCH_AFFINE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Enables or disables the wasm32 batched-affine MSM dispatch.
+pub fn set_wasm_batch_affine_msm(enabled: bool) {
+    BATCH_AFFINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn batch_affine_enabled() -> bool {
+    BATCH_AFFINE_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {

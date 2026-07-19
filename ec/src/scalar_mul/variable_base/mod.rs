@@ -40,7 +40,7 @@ pub mod wasm_stats {
 }
 
 #[inline]
-fn record_msm(_n: usize) {
+pub(crate) fn record_msm(_n: usize) {
     #[cfg(target_arch = "wasm32")]
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -127,7 +127,7 @@ pub trait VariableBaseMSM: ScalarMul {
 }
 
 // Compute msm using windowed non-adjacent form
-fn msm_bigint_wnaf<V: VariableBaseMSM>(
+pub(crate) fn msm_bigint_wnaf<V: VariableBaseMSM>(
     bases: &[V::MulBase],
     bigints: &[<V::ScalarField as PrimeField>::BigInt],
 ) -> V {
@@ -196,7 +196,7 @@ fn msm_bigint_wnaf<V: VariableBaseMSM>(
 }
 
 /// Optimized implementation of multi-scalar multiplication.
-fn msm_bigint<V: VariableBaseMSM>(
+pub(crate) fn msm_bigint<V: VariableBaseMSM>(
     bases: &[V::MulBase],
     bigints: &[<V::ScalarField as PrimeField>::BigInt],
 ) -> V {
