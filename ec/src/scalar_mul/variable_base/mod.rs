@@ -34,6 +34,8 @@ type DefaultHasher = ahash::AHasher;
 )))]
 type DefaultHasher = fnv::FnvHasher;
 
+pub mod batch_affine;
+
 pub trait VariableBaseMSM: ScalarMul + for<'a> AddAssign<&'a Self::Bucket> {
     type Bucket: Default
         + Copy
