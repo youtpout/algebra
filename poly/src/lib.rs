@@ -1,7 +1,9 @@
 //! This crate implements functions for manipulating polynomials over finite
 //! fields, including FFTs.
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+// deny, not forbid: domain::radix2::lazy uses two runtime-validated memory
+// reinterpretations (see its module docs) under a local allow.
+#![deny(unsafe_code)]
 #![allow(clippy::suspicious_op_assign_impl, clippy::suspicious_arithmetic_impl)]
 
 pub mod domain;

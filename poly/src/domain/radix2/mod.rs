@@ -11,6 +11,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{fmt, vec::*};
 
 mod fft;
+mod lazy;
 
 /// Factor that determines if a the degree aware FFT should be called.
 const DEGREE_AWARE_FFT_THRESHOLD_FACTOR: usize = 1 << 2;

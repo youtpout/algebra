@@ -330,7 +330,8 @@ pub trait EvaluationDomain<F: FftField>:
 
 /// Types that can be FFT-ed must implement this trait.
 pub trait DomainCoeff<F: FftField>:
-    Copy
+    'static
+    + Copy
     + Send
     + Sync
     + core::ops::Add<Output = Self>
@@ -347,7 +348,8 @@ pub trait DomainCoeff<F: FftField>:
 impl<T, F> DomainCoeff<F> for T
 where
     F: FftField,
-    T: Copy
+    T: 'static
+        + Copy
         + Send
         + Sync
         + core::ops::Add<Output = Self>

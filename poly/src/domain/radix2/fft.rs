@@ -249,7 +249,18 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
         }
     }
 
-    fn io_helper<T: DomainCoeff<F>>(&self, xi: &mut [T], root: F) {
+    pub(super) fn io_helper<T: DomainCoeff<F>>(&self, xi: &mut [T], root: F) {
+        // wasm32: butterflies in the lazy-carry 29-bit domain when the
+        // field qualifies (identical output layout — see radix2::lazy).
+        #[cfg(target_arch = "wasm32")]
+        if xi.len() >= super::lazy::MIN_LAZY_FFT_SIZE {
+            if let Some(xi) = super::lazy::as_field_mut::<F, T>(xi) {
+                if let Some(params) = super::lazy::detect::<F>() {
+                    return self.io_helper_lazy(xi, root, &params);
+                }
+            }
+        }
+
         let mut roots = self.roots_of_unity(root);
         let mut step = 1;
         let mut first = true;
@@ -294,7 +305,18 @@ impl<F: FftField> Radix2EvaluationDomain<F> {
         }
     }
 
-    fn oi_helper<T: DomainCoeff<F>>(&self, xi: &mut [T], root: F, start_gap: usize) {
+    pub(super) fn oi_helper<T: DomainCoeff<F>>(&self, xi: &mut [T], root: F, start_gap: usize) {
+        // wasm32: butterflies in the lazy-carry 29-bit domain when the
+        // field qualifies (identical output layout — see radix2::lazy).
+        #[cfg(target_arch = "wasm32")]
+        if xi.len() >= super::lazy::MIN_LAZY_FFT_SIZE {
+            if let Some(xi) = super::lazy::as_field_mut::<F, T>(xi) {
+                if let Some(params) = super::lazy::detect::<F>() {
+                    return self.oi_helper_lazy(xi, root, start_gap, &params);
+                }
+            }
+        }
+
         let roots_cache = self.roots_of_unity(root);
 
         // The `cmp::min` is only necessary for the case where
