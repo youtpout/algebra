@@ -51,13 +51,17 @@ fn unpack(v: &L) -> W {
 /// worth amortizing over the stages.
 pub(crate) const MIN_LAZY_FFT_SIZE: usize = 128;
 
-/// Runtime kill-switch for the wasm32 lazy FFT dispatch (default on).
-/// The boundary conversions (~2.5n multiplications) only pay for
-/// themselves where butterfly arithmetic dominates — hosts can turn the
-/// dispatch off (or measurement harnesses can compare both paths in one
-/// build).
+/// Runtime switch for the wasm32 lazy FFT dispatch — DEFAULT OFF.
+/// Measured on V8/x64 against the generic parallel path (2^16 and 2^12,
+/// pools of 2/4/8/15/31 rayon threads): the generic path wins at every
+/// width. The lazy butterflies are ~28% cheaper serially, but a parallel
+/// FFT has such low arithmetic intensity that it is bound by the memory
+/// system, not by multiplications — the advantage evaporates while the
+/// boundary conversions (~2.5n muls) and per-call root conversion remain
+/// as pure overhead. The switch stays for narrow-pool hosts and for
+/// measurement harnesses (both paths in one build, cross-checked).
 static LAZY_FFT_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Enables or disables the wasm32 lazy-carry FFT dispatch at runtime.
 pub fn set_wasm_lazy_fft(enabled: bool) {
