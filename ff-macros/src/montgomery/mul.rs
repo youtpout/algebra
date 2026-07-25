@@ -55,32 +55,13 @@ pub(super) fn mul_assign_impl(
                     )]
                     #[allow(unsafe_code, unused_mut)]
                     ark_ff::x86_64_asm_mul!(#num_limbs, (a.0).0, (b.0).0);
-                } else if cfg!(target_arch = "aarch64") && #num_limbs == 4 {
-                    // aarch64 counterpart of the x86_64 assembly path: the
-                    // same no-carry CIOS with the carries kept in the flags.
-                    #[cfg(all(
-                        target_arch = "aarch64",
+                } else {
+                    #[cfg(
                         not(all(
                             feature = "asm",
                             target_feature = "bmi2",
                             target_feature = "adx",
                             target_arch = "x86_64"
-                        ))
-                    ))]
-                    #[allow(unsafe_code)]
-                    {
-                        ark_ff::fields::models::fp::mul_assign_aarch64::<Self, #num_limbs>(a, b);
-                    }
-                } else {
-                    #[cfg(
-                        not(any(
-                            all(
-                                feature = "asm",
-                                target_feature = "bmi2",
-                                target_feature = "adx",
-                                target_arch = "x86_64"
-                            ),
-                            target_arch = "aarch64"
                         ))
                     )]
                     {

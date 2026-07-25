@@ -977,6 +977,24 @@ impl<T: MontConfig<N>, const N: usize> FpConfig<N> for MontBackend<T, N> {
     /// zero bit in the rest of the modulus.
     #[inline]
     fn mul_assign(a: &mut Fp<Self, N>, b: &Fp<Self, N>) {
+        // Target-specific multiplications are dispatched here rather than in
+        // `MontConfig::mul_assign`: the derive macro generates its own
+        // `MontConfig::mul_assign`, so anything added to that trait's default
+        // never runs for a derived field. This method sits upstream of the
+        // derive and always runs.
+        #[cfg(target_arch = "wasm32")]
+        if T::CAN_USE_NO_CARRY_MUL_OPT && 2 * N <= 24 {
+            // 32-bit-digit CIOS: wasm has a native 32x32->64 multiply but
+            // emulates the 64x64->128 products of the 64-bit path.
+            mul_assign_u32_digits::<T, N>(a, b);
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if T::CAN_USE_NO_CARRY_MUL_OPT && N == 4 {
+            mul_assign_aarch64::<T, N>(a, b);
+            a.subtract_modulus();
+            return;
+        }
         T::mul_assign(a, b)
     }
 
@@ -987,6 +1005,12 @@ impl<T: MontConfig<N>, const N: usize> FpConfig<N> for MontBackend<T, N> {
     #[inline]
     #[allow(unused_braces, clippy::absurd_extreme_comparisons)]
     fn square_in_place(a: &mut Fp<Self, N>) {
+        #[cfg(target_arch = "wasm32")]
+        if T::CAN_USE_NO_CARRY_MUL_OPT && 2 * N <= 24 {
+            let b = *a;
+            mul_assign_u32_digits::<T, N>(a, &b);
+            return;
+        }
         T::square_in_place(a)
     }
 
