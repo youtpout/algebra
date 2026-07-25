@@ -989,12 +989,6 @@ impl<T: MontConfig<N>, const N: usize> FpConfig<N> for MontBackend<T, N> {
             mul_assign_u32_digits::<T, N>(a, b);
             return;
         }
-        #[cfg(target_arch = "aarch64")]
-        if T::CAN_USE_NO_CARRY_MUL_OPT && N == 4 {
-            mul_assign_aarch64::<T, N>(a, b);
-            a.subtract_modulus();
-            return;
-        }
         T::mul_assign(a, b)
     }
 

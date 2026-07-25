@@ -20,6 +20,10 @@ use core::iter;
 mod montgomery_backend;
 /// Lazy-carry 29-bit-limb arithmetic for wasm hot kernels (see module docs).
 pub mod lazy29;
+
+/// Two-lane NEON multiplication over the 29-bit-limb domain (aarch64 only).
+#[cfg(target_arch = "aarch64")]
+pub mod neon29;
 pub use montgomery_backend::*;
 
 /// A trait that specifies the configuration of a prime field.
