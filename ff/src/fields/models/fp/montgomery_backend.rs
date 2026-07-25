@@ -93,6 +93,214 @@ pub fn mul_assign_u32_digits<T: MontConfig<N>, const N: usize>(
     a.subtract_modulus();
 }
 
+/// Montgomery CIOS multiplication for aarch64, four 64-bit limbs.
+///
+/// `ark-ff` ships assembly carry chains for x86_64 only; every other target
+/// runs the portable loop, where each 64x64 product materialises its carry
+/// through a 128-bit temporary. This is the same no-carry CIOS with the
+/// carries kept in the condition flags: per round the eight products are
+/// issued before the two `adds`/`adcs` chains that consume them, and the
+/// accumulator is rotated by one word instead of shifted.
+///
+/// Requires `CAN_USE_NO_CARRY_MUL_OPT` (the caller dispatches only inside
+/// that branch) and `N == 4`. Returns the product before the conditional
+/// subtraction of the modulus, exactly like the portable loop.
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+#[inline(always)]
+pub fn mul_assign_aarch64<T: MontConfig<N>, const N: usize>(
+    a: &mut Fp<MontBackend<T, N>, N>,
+    b: &Fp<MontBackend<T, N>, N>,
+) {
+    debug_assert!(T::CAN_USE_NO_CARRY_MUL_OPT);
+    debug_assert_eq!(N, 4);
+    let (a0, a1, a2, a3) = ((a.0).0[0], (a.0).0[1], (a.0).0[2], (a.0).0[3]);
+    let (b0, b1, b2, b3) = ((b.0).0[0], (b.0).0[1], (b.0).0[2], (b.0).0[3]);
+    let (p0, p1, p2, p3) = (
+        T::MODULUS.0[0],
+        T::MODULUS.0[1],
+        T::MODULUS.0[2],
+        T::MODULUS.0[3],
+    );
+    let (mut t0, mut t1, mut t2, mut t3, mut t4) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    unsafe {
+        core::arch::asm!(
+            "mov {t0}, xzr",
+            "mov {t1}, xzr",
+            "mov {t2}, xzr",
+            "mov {t3}, xzr",
+            "mov {t4}, xzr",
+            // round 0: t += a * b[0]
+            "mul   {l0}, {a0}, {b0}",
+            "umulh {h0}, {a0}, {b0}",
+            "mul   {l1}, {a1}, {b0}",
+            "umulh {h1}, {a1}, {b0}",
+            "mul   {l2}, {a2}, {b0}",
+            "umulh {h2}, {a2}, {b0}",
+            "mul   {l3}, {a3}, {b0}",
+            "umulh {h3}, {a3}, {b0}",
+            "adds  {t0}, {t0}, {l0}",
+            "adcs  {t1}, {t1}, {l1}",
+            "adcs  {t2}, {t2}, {l2}",
+            "adcs  {t3}, {t3}, {l3}",
+            "adc   {t4}, {t4}, xzr",
+            "adds  {t1}, {t1}, {h0}",
+            "adcs  {t2}, {t2}, {h1}",
+            "adcs  {t3}, {t3}, {h2}",
+            "adc   {t4}, {t4}, {h3}",
+            // round 0: t += m * modulus, low word cancels
+            "mul   {m}, {t0}, {inv}",
+            "mul   {l0}, {m}, {p0}",
+            "umulh {h0}, {m}, {p0}",
+            "mul   {l1}, {m}, {p1}",
+            "umulh {h1}, {m}, {p1}",
+            "mul   {l2}, {m}, {p2}",
+            "umulh {h2}, {m}, {p2}",
+            "mul   {l3}, {m}, {p3}",
+            "umulh {h3}, {m}, {p3}",
+            "adds  {t0}, {t0}, {l0}",
+            "adcs  {t1}, {t1}, {l1}",
+            "adcs  {t2}, {t2}, {l2}",
+            "adcs  {t3}, {t3}, {l3}",
+            "adc   {t4}, {t4}, xzr",
+            "adds  {t1}, {t1}, {h0}",
+            "adcs  {t2}, {t2}, {h1}",
+            "adcs  {t3}, {t3}, {h2}",
+            "adc   {t4}, {t4}, {h3}",
+            "mov   {t0}, xzr",
+            // round 1: t += a * b[1]
+            "mul   {l0}, {a0}, {b1}",
+            "umulh {h0}, {a0}, {b1}",
+            "mul   {l1}, {a1}, {b1}",
+            "umulh {h1}, {a1}, {b1}",
+            "mul   {l2}, {a2}, {b1}",
+            "umulh {h2}, {a2}, {b1}",
+            "mul   {l3}, {a3}, {b1}",
+            "umulh {h3}, {a3}, {b1}",
+            "adds  {t1}, {t1}, {l0}",
+            "adcs  {t2}, {t2}, {l1}",
+            "adcs  {t3}, {t3}, {l2}",
+            "adcs  {t4}, {t4}, {l3}",
+            "adc   {t0}, {t0}, xzr",
+            "adds  {t2}, {t2}, {h0}",
+            "adcs  {t3}, {t3}, {h1}",
+            "adcs  {t4}, {t4}, {h2}",
+            "adc   {t0}, {t0}, {h3}",
+            // round 1: t += m * modulus, low word cancels
+            "mul   {m}, {t1}, {inv}",
+            "mul   {l0}, {m}, {p0}",
+            "umulh {h0}, {m}, {p0}",
+            "mul   {l1}, {m}, {p1}",
+            "umulh {h1}, {m}, {p1}",
+            "mul   {l2}, {m}, {p2}",
+            "umulh {h2}, {m}, {p2}",
+            "mul   {l3}, {m}, {p3}",
+            "umulh {h3}, {m}, {p3}",
+            "adds  {t1}, {t1}, {l0}",
+            "adcs  {t2}, {t2}, {l1}",
+            "adcs  {t3}, {t3}, {l2}",
+            "adcs  {t4}, {t4}, {l3}",
+            "adc   {t0}, {t0}, xzr",
+            "adds  {t2}, {t2}, {h0}",
+            "adcs  {t3}, {t3}, {h1}",
+            "adcs  {t4}, {t4}, {h2}",
+            "adc   {t0}, {t0}, {h3}",
+            "mov   {t1}, xzr",
+            // round 2: t += a * b[2]
+            "mul   {l0}, {a0}, {b2}",
+            "umulh {h0}, {a0}, {b2}",
+            "mul   {l1}, {a1}, {b2}",
+            "umulh {h1}, {a1}, {b2}",
+            "mul   {l2}, {a2}, {b2}",
+            "umulh {h2}, {a2}, {b2}",
+            "mul   {l3}, {a3}, {b2}",
+            "umulh {h3}, {a3}, {b2}",
+            "adds  {t2}, {t2}, {l0}",
+            "adcs  {t3}, {t3}, {l1}",
+            "adcs  {t4}, {t4}, {l2}",
+            "adcs  {t0}, {t0}, {l3}",
+            "adc   {t1}, {t1}, xzr",
+            "adds  {t3}, {t3}, {h0}",
+            "adcs  {t4}, {t4}, {h1}",
+            "adcs  {t0}, {t0}, {h2}",
+            "adc   {t1}, {t1}, {h3}",
+            // round 2: t += m * modulus, low word cancels
+            "mul   {m}, {t2}, {inv}",
+            "mul   {l0}, {m}, {p0}",
+            "umulh {h0}, {m}, {p0}",
+            "mul   {l1}, {m}, {p1}",
+            "umulh {h1}, {m}, {p1}",
+            "mul   {l2}, {m}, {p2}",
+            "umulh {h2}, {m}, {p2}",
+            "mul   {l3}, {m}, {p3}",
+            "umulh {h3}, {m}, {p3}",
+            "adds  {t2}, {t2}, {l0}",
+            "adcs  {t3}, {t3}, {l1}",
+            "adcs  {t4}, {t4}, {l2}",
+            "adcs  {t0}, {t0}, {l3}",
+            "adc   {t1}, {t1}, xzr",
+            "adds  {t3}, {t3}, {h0}",
+            "adcs  {t4}, {t4}, {h1}",
+            "adcs  {t0}, {t0}, {h2}",
+            "adc   {t1}, {t1}, {h3}",
+            "mov   {t2}, xzr",
+            // round 3: t += a * b[3]
+            "mul   {l0}, {a0}, {b3}",
+            "umulh {h0}, {a0}, {b3}",
+            "mul   {l1}, {a1}, {b3}",
+            "umulh {h1}, {a1}, {b3}",
+            "mul   {l2}, {a2}, {b3}",
+            "umulh {h2}, {a2}, {b3}",
+            "mul   {l3}, {a3}, {b3}",
+            "umulh {h3}, {a3}, {b3}",
+            "adds  {t3}, {t3}, {l0}",
+            "adcs  {t4}, {t4}, {l1}",
+            "adcs  {t0}, {t0}, {l2}",
+            "adcs  {t1}, {t1}, {l3}",
+            "adc   {t2}, {t2}, xzr",
+            "adds  {t4}, {t4}, {h0}",
+            "adcs  {t0}, {t0}, {h1}",
+            "adcs  {t1}, {t1}, {h2}",
+            "adc   {t2}, {t2}, {h3}",
+            // round 3: t += m * modulus, low word cancels
+            "mul   {m}, {t3}, {inv}",
+            "mul   {l0}, {m}, {p0}",
+            "umulh {h0}, {m}, {p0}",
+            "mul   {l1}, {m}, {p1}",
+            "umulh {h1}, {m}, {p1}",
+            "mul   {l2}, {m}, {p2}",
+            "umulh {h2}, {m}, {p2}",
+            "mul   {l3}, {m}, {p3}",
+            "umulh {h3}, {m}, {p3}",
+            "adds  {t3}, {t3}, {l0}",
+            "adcs  {t4}, {t4}, {l1}",
+            "adcs  {t0}, {t0}, {l2}",
+            "adcs  {t1}, {t1}, {l3}",
+            "adc   {t2}, {t2}, xzr",
+            "adds  {t4}, {t4}, {h0}",
+            "adcs  {t0}, {t0}, {h1}",
+            "adcs  {t1}, {t1}, {h2}",
+            "adc   {t2}, {t2}, {h3}",
+            "mov   {t3}, xzr",
+            a0 = in(reg) a0, a1 = in(reg) a1, a2 = in(reg) a2, a3 = in(reg) a3,
+            b0 = in(reg) b0, b1 = in(reg) b1, b2 = in(reg) b2, b3 = in(reg) b3,
+            p0 = in(reg) p0, p1 = in(reg) p1, p2 = in(reg) p2, p3 = in(reg) p3,
+            inv = in(reg) T::INV,
+            t0 = inout(reg) t0, t1 = inout(reg) t1, t2 = inout(reg) t2,
+            t3 = inout(reg) t3, t4 = inout(reg) t4,
+            l0 = out(reg) _, l1 = out(reg) _, l2 = out(reg) _, l3 = out(reg) _,
+            h0 = out(reg) _, h1 = out(reg) _, h2 = out(reg) _, h3 = out(reg) _,
+            m = out(reg) _,
+            options(pure, nomem, nostack),
+        );
+    }
+    // Four rounds rotated the accumulator by four words.
+    (a.0).0[0] = t4;
+    (a.0).0[1] = t0;
+    (a.0).0[2] = t1;
+    (a.0).0[3] = t2;
+}
+
 /// A trait that specifies the constants and arithmetic procedures
 /// for Montgomery arithmetic over the prime field defined by `MODULUS`.
 ///
@@ -268,6 +476,14 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
                     6 => { ark_ff_asm::x86_64_asm_mul!(6, (a.0).0, (b.0).0); },
                     _ => unsafe { ark_std::hint::unreachable_unchecked() },
                 };
+            } else if cfg!(target_arch = "aarch64") && N == 4 {
+                // aarch64 patch: CIOS with the carries kept in the flags.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    mul_assign_aarch64::<Self, N>(a, b);
+                    a.subtract_modulus();
+                }
+                return;
             } else if cfg!(target_arch = "wasm32") && 2 * N <= 24 {
                 // wasm patch: 32-bit-digit CIOS (native 32x32->64 multiply);
                 // includes the final conditional subtraction.
