@@ -15,6 +15,30 @@
 //! `2 * p`, with the same contract as [`super::lazy29::mont_mul_p`]; entering
 //! and leaving the domain is the caller's business (see `lazy29::enter`/`exit`)
 //! and only pays off when amortised over many operations.
+//!
+//! # Measured: a wash on a Cortex-A75 (Pixel 3, Snapdragon 845)
+//!
+//! Per single field product, independent streams, the shape the prover issues:
+//!
+//! | path | ns/mul |
+//! |---|---|
+//! | 64-bit CIOS (what ships) | 98.6 |
+//! | 29-bit CIOS, scalar | 177.5 |
+//! | 29-bit CIOS, this module | 92.4 |
+//!
+//! The vectorisation itself is close to ideal -- two lanes turn 177.5 into
+//! 92.4, a 1.87x -- but the reduced radix starts 1.9x behind: nine limbs of 29
+//! bits need ~153 multiply-accumulates where four 64-bit limbs need ~32. The
+//! two cancel, leaving 1.07x before the domain entry/exit conversions are even
+//! counted. Four lanes would not change it: `vmlal_u32` plus
+//! `vmlal_high_u32` covers four elements in two instructions, the same
+//! per-element instruction count.
+//!
+//! The reason is structural. aarch64 gives scalar code a full 64x64->128
+//! multiplier (`mul`/`umulh`), so cutting the radix to fit SIMD throws away 4x
+//! of multiplier width to buy 2x of lanes. On wasm the trade is even because
+//! the scalar path has no 64x64->128 at all; on x86_64 with `mulx` it is
+//! clearly negative; here it is a wash.
 
 #![cfg(target_arch = "aarch64")]
 
