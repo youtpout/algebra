@@ -984,8 +984,11 @@ impl<T: MontConfig<N>, const N: usize> FpConfig<N> for MontBackend<T, N> {
         // derive and always runs.
         #[cfg(target_arch = "wasm32")]
         if T::CAN_USE_NO_CARRY_MUL_OPT && 2 * N <= 24 {
-            // 32-bit-digit CIOS: wasm has a native 32x32->64 multiply but
-            // emulates the 64x64->128 products of the 64-bit path.
+            // TEMPORARY probe: the work is done twice, so a live dispatch
+            // shows up as a doubled measurement.
+            let mut probe = *a;
+            mul_assign_u32_digits::<T, N>(&mut probe, b);
+            core::hint::black_box(&probe);
             mul_assign_u32_digits::<T, N>(a, b);
             return;
         }
