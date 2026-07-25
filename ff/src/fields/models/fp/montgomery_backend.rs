@@ -105,6 +105,18 @@ pub fn mul_assign_u32_digits<T: MontConfig<N>, const N: usize>(
 /// Requires `CAN_USE_NO_CARRY_MUL_OPT` (the caller dispatches only inside
 /// that branch) and `N == 4`. Returns the product before the conditional
 /// subtraction of the modulus, exactly like the portable loop.
+///
+/// # Measured: this is slower than the portable loop
+///
+/// On a Pixel 3 (Cortex-A75), dependent-chain latency on Vesta: 96 ns/mul for
+/// the portable loop, 129 ns/mul through here. The x86_64 trick does not
+/// transpose: `adcx`/`adox` give x86 two independent carry chains, while
+/// aarch64 has a single flag register, so the chain stays serial. On top of
+/// that an assembly block is a scheduling barrier, and the portable loop wins
+/// precisely because the compiler overlaps consecutive multiplications.
+///
+/// Kept behind the dispatch so the experiment is reproducible, not because it
+/// should ship.
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
 #[inline(always)]
